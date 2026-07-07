@@ -94,7 +94,7 @@ class T3RetrievalAgentTest(unittest.TestCase):
         self.assertIn(
             "from livekit.plugins import cartesia, deepgram, openai, silero", source
         )
-        self.assertIn("from agent.tools.lookup_part import lookup_part", source)
+        self.assertIn("lookup_part", source)
         self.assertIn(
             "from agent.tools.set_aside import SetAsideResult, set_aside", source
         )

@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from collections.abc import Awaitable
 from typing import cast
 
@@ -16,7 +17,13 @@ from agent import session_limits
 from agent.db import save_call
 from agent.outcome import CallOutcome
 from agent.process_lock import AgentProcessLock, AgentProcessLockError
-from agent.tools.lookup_part import lookup_part
+from agent.tools.lookup_part import (
+    AmbiguousResult,
+    SingleMatchResult,
+    SupersededResult,
+    lookup_part,
+    part_index,
+)
 from agent.tools.set_aside import SetAsideResult, set_aside
 from agent.tools.transfer import TransferResult, transfer_to_human
 
@@ -30,15 +37,6 @@ CLOSING_LINE_TIMEOUT_SECONDS = 5.0
 SESSION_LIMIT_SHUTDOWN_REASON = "session limits reached"
 SessionLimits = session_limits.SessionLimits
 
-LOOKUP_PART_TOOL = function_tool(
-    lookup_part,
-    name="lookup_part",
-    description=(
-        "Look up an auto part using mandatory year, make, and model metadata "
-        "filters. Returns single_match, ambiguous, superseded, or no_match."
-    ),
-)
-
 
 class PartsLineSessionState:
     def __init__(self) -> None:
@@ -46,13 +44,136 @@ class PartsLineSessionState:
         self.call_outcome = CallOutcome()
 
 
+def part_name(part_number: str) -> str:
+    """Look up the human-readable name for a part number from the catalog."""
+    try:
+        record = part_index()[part_number]
+    except KeyError:
+        return part_number
+    return record["metadata"].get("name", part_number)
+
+
+async def lookup_part_for_session(
+    ctx: RunContext[PartsLineSessionState],
+    part: str,
+    year: str,
+    make: str,
+    model: str,
+    engine: str | None = None,
+    trim: str | None = None,
+) -> object:
+    result = await lookup_part(
+        part=part, year=year, make=make, model=model, engine=engine, trim=trim
+    )
+
+    outcome = ctx.userdata.call_outcome
+    outcome.record_vehicle(year=year, make=make, model=model, engine=engine, trim=trim)
+
+    status = result.get("status")
+
+    if status == "single_match":
+        single = cast("SingleMatchResult", result)
+        outcome.record_quoted_part(
+            part_number=single["part_number"],
+            name=part_name(single["part_number"]),
+            price=single["price"],
+            stock=single["stock"],
+            resolution="quoted",
+        )
+    elif status == "superseded":
+        superseded = cast("SupersededResult", result)
+        replacement = superseded["replacement_part_number"]
+        outcome.record_quoted_part(
+            part_number=replacement,
+            name=part_name(replacement),
+            price=superseded["price"],
+            stock=superseded["stock"],
+            resolution="superseded_quoted",
+        )
+    elif status == "no_match":
+        outcome.set_final_outcome("no_match")
+
+    await emit_lookup_chip(
+        ctx,
+        result=result,
+        year=year,
+        make=make,
+        model=model,
+        engine=engine,
+        trim=trim,
+    )
+
+    return result
+
+
+def parse_quantity(value: object, available_stock: int) -> int:
+    """Coerce an LLM-supplied quantity into an int.
+
+    Handles ints, numeric strings, number words, and the common
+    "both"/"all"/"them all" phrasing that a caller uses to mean
+    "everything you have in stock".
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int; treat it as unset
+        return 1
+    if isinstance(value, int):
+        return value
+
+    text = str(value).strip().lower()
+    if not text:
+        return 1
+
+    # "both", "all", "all of them", "them all" -> all available stock
+    if any(word in text for word in ("both", "all", "them all", "every")):
+        return max(available_stock, 1)
+
+    number_words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "a": 1,
+        "an": 1,
+        "a couple": 2,
+        "couple": 2,
+        "a few": 3,
+        "few": 3,
+    }
+    if text in number_words:
+        return number_words[text]
+
+    # pull the first integer out of the string ("2", "2 of them")
+    match = re.search(r"\d+", text)
+    if match:
+        return int(match.group())
+
+    return 1
+
+
 async def set_aside_for_session(
     ctx: RunContext[PartsLineSessionState],
     first_name: str,
     part_number: str,
-    quantity: int = 1,
+    quantity: object = 1,
 ) -> SetAsideResult:
-    return set_aside(ctx.userdata.call_outcome, first_name, part_number, quantity)
+    outcome = ctx.userdata.call_outcome
+    quoted = next(
+        (
+            p
+            for p in outcome.parts
+            if p["part_number"].upper() == part_number.strip().upper()
+        ),
+        None,
+    )
+    available = quoted["stock"] if quoted else 0
+    parsed_quantity = parse_quantity(quantity, available)
+    return set_aside(outcome, first_name, part_number, parsed_quantity)
 
 
 async def transfer_to_human_for_session(
@@ -60,6 +181,15 @@ async def transfer_to_human_for_session(
 ) -> TransferResult:
     return transfer_to_human(ctx.userdata.call_outcome, reason)
 
+
+LOOKUP_PART_TOOL = function_tool(
+    lookup_part_for_session,
+    name="lookup_part",
+    description=(
+        "Look up an auto part using mandatory year, make, and model metadata "
+        "filters. Returns single_match, ambiguous, superseded, or no_match."
+    ),
+)
 
 SET_ASIDE_TOOL = function_tool(
     set_aside_for_session,
@@ -138,6 +268,138 @@ async def _await_if_needed(result: object) -> None:
         await cast(Awaitable[object], result)
 
 
+def lookup_chip_filter(
+    *,
+    year: str,
+    make: str,
+    model: str,
+    engine: str | None,
+    trim: str | None,
+) -> dict[str, str]:
+    filters = {"year": year, "make": make, "model": model}
+    if engine:
+        filters["engine"] = engine
+    if trim:
+        filters["trim"] = trim
+    return filters
+
+
+def lookup_chip_parts(result: object) -> list[dict[str, object]]:
+    status = result.get("status") if isinstance(result, dict) else None
+    if status == "single_match":
+        single = cast("SingleMatchResult", result)
+        return [
+            {
+                "part_number": single["part_number"],
+                "name": part_name(single["part_number"]),
+                "price": single["price"],
+                "stock": single["stock"],
+            }
+        ]
+    if status == "superseded":
+        superseded = cast("SupersededResult", result)
+        old_part_number = superseded["old_part_number"]
+        replacement = superseded["replacement_part_number"]
+        return [
+            {"part_number": old_part_number, "name": part_name(old_part_number)},
+            {
+                "part_number": replacement,
+                "name": part_name(replacement),
+                "price": superseded["price"],
+                "stock": superseded["stock"],
+            },
+        ]
+    return []
+
+
+def lookup_chip_payload(
+    result: object,
+    *,
+    year: str,
+    make: str,
+    model: str,
+    engine: str | None,
+    trim: str | None,
+) -> dict[str, object]:
+    status_value = result.get("status") if isinstance(result, dict) else None
+    status = status_value if isinstance(status_value, str) else "no_match"
+    result_label = {
+        "single_match": "single",
+        "ambiguous": "ambiguous",
+        "superseded": "superseded",
+        "no_match": "no_match",
+    }.get(status, "no_match")
+    payload: dict[str, object] = {
+        "filter": lookup_chip_filter(
+            year=year, make=make, model=model, engine=engine, trim=trim
+        ),
+        "result": result_label,
+        "parts": lookup_chip_parts(result),
+    }
+    if status == "ambiguous":
+        ambiguous = cast("AmbiguousResult", result)
+        payload["candidates"] = {
+            "attribute": ambiguous["attribute"],
+            "values": ambiguous["candidates"],
+        }
+    return payload
+
+
+def _room_from_tool_context(ctx: object) -> object | None:
+    room = getattr(ctx, "room", None)
+    if room is not None:
+        return room
+
+    session = getattr(ctx, "session", None)
+    if session is None:
+        return None
+    try:
+        room_io = getattr(session, "room_io", None)
+    except RuntimeError:
+        return None
+    return getattr(room_io, "room", None)
+
+
+async def publish_data_event(
+    room: object | None, topic: str, payload: dict[str, object]
+) -> None:
+    if room is None:
+        return
+
+    participant = getattr(room, "local_participant", None)
+    publish_data = getattr(participant, "publish_data", None)
+    if publish_data is None:
+        return
+
+    data = json.dumps(payload, separators=(",", ":"))
+    result = publish_data(data, reliable=True, topic=topic)
+    await _await_if_needed(result)
+
+
+async def emit_lookup_chip(
+    ctx: object,
+    result: object,
+    *,
+    year: str,
+    make: str,
+    model: str,
+    engine: str | None,
+    trim: str | None,
+) -> None:
+    await publish_data_event(
+        _room_from_tool_context(ctx),
+        "lookup_chip",
+        lookup_chip_payload(
+            result,
+            year=year,
+            make=make,
+            model=model,
+            engine=engine,
+            trim=trim,
+        ),
+    )
+
+
 def _call_outcome_for_session(session: object) -> CallOutcome | None:
     userdata = getattr(session, "userdata", None)
     outcome = getattr(userdata, "call_outcome", None)
@@ -147,20 +409,14 @@ def _call_outcome_for_session(session: object) -> CallOutcome | None:
 
 
 async def emit_call_ended(room: object, outcome: CallOutcome) -> None:
-    participant = getattr(room, "local_participant", None)
-    publish_data = getattr(participant, "publish_data", None)
-    if publish_data is None:
-        return
-
-    payload = json.dumps(
+    await publish_data_event(
+        room,
+        "call_ended",
         {
             "call_id": outcome.call_id,
             "outcome": outcome.outcome,
         },
-        separators=(",", ":"),
     )
-    result = publish_data(payload, reliable=True, topic="call_ended")
-    await _await_if_needed(result)
 
 
 async def _shutdown_for_session_limits(session, ctx) -> None:

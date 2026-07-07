@@ -35,6 +35,8 @@ ENDPOINTING_MIN_DELAY_SECONDS = 1.0
 ENDPOINTING_MAX_DELAY_SECONDS = 3.0
 CLOSING_LINE_TIMEOUT_SECONDS = 5.0
 SESSION_LIMIT_SHUTDOWN_REASON = "session limits reached"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 SessionLimits = session_limits.SessionLimits
 
 
@@ -210,18 +212,26 @@ TRANSFER_TO_HUMAN_TOOL = function_tool(
 )
 
 
-def required_env(name: str) -> str:
+def required_env(name: str, config_name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
-        raise RuntimeError(f"{name} is required for Dartmouth Chat LLM config")
+        raise RuntimeError(f"{name} is required for {config_name}")
     return value
+
+
+def build_llm():
+    return openai.LLM(
+        model=GROQ_MODEL,
+        api_key=required_env("GROQ_API_KEY", "Groq LLM config"),
+        base_url=GROQ_BASE_URL,
+    )
 
 
 def build_dartmouth_chat_llm():
     return openai.LLM(
-        model=required_env("DARTMOUTH_CHAT_MODEL"),
-        api_key=required_env("DARTMOUTH_CHAT_API_KEY"),
-        base_url=required_env("DARTMOUTH_CHAT_BASE_URL"),
+        model=required_env("DARTMOUTH_CHAT_MODEL", "Dartmouth Chat LLM config"),
+        api_key=required_env("DARTMOUTH_CHAT_API_KEY", "Dartmouth Chat LLM config"),
+        base_url=required_env("DARTMOUTH_CHAT_BASE_URL", "Dartmouth Chat LLM config"),
     )
 
 
@@ -242,7 +252,7 @@ def build_session():
 
     return AgentSession(
         stt=deepgram.STT(model="nova-3", language="en"),
-        llm=build_dartmouth_chat_llm(),
+        llm=build_llm(),
         tts=cartesia.TTS(model="sonic-3"),
         vad=silero.VAD.load(),
         tools=[LOOKUP_PART_TOOL, SET_ASIDE_TOOL, TRANSFER_TO_HUMAN_TOOL],

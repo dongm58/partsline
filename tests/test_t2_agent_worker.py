@@ -162,7 +162,8 @@ class T2AgentTest(unittest.TestCase):
         self.assertIn('cartesia.TTS(model="sonic-3"', source)
         self.assertIn("silero.VAD.load()", source)
         self.assertIn("inference.TurnDetector()", source)
-        self.assertIn("llm=build_dartmouth_chat_llm()", source)
+        self.assertIn("llm=build_llm()", source)
+        self.assertNotIn("llm=build_dartmouth_chat_llm()", source)
         self.assertIn(
             "tools=[LOOKUP_PART_TOOL, SET_ASIDE_TOOL, TRANSFER_TO_HUMAN_TOOL]",
             source,

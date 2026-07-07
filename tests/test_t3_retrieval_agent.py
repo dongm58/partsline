@@ -80,9 +80,10 @@ class T3RetrievalAgentTest(unittest.TestCase):
         ]:
             self.assertIn(required_text, prompt_source)
 
-    def test_env_template_uses_dartmouth_chat_not_openai_key(self) -> None:
+    def test_env_template_uses_groq_and_keeps_dartmouth_chat_fallback(self) -> None:
         env_template = ENV_EXAMPLE.read_text(encoding="utf-8")
 
+        self.assertIn("GROQ_API_KEY=", env_template)
         self.assertIn("DARTMOUTH_CHAT_API_KEY=", env_template)
         self.assertIn("DARTMOUTH_CHAT_BASE_URL=", env_template)
         self.assertIn("DARTMOUTH_CHAT_MODEL=", env_template)
@@ -107,7 +108,10 @@ class T3RetrievalAgentTest(unittest.TestCase):
         self.assertIn("lookup_part,", source)
         self.assertIn("set_aside_for_session,", source)
         self.assertIn("transfer_to_human_for_session,", source)
+        self.assertIn("build_llm", source)
         self.assertIn("build_dartmouth_chat_llm", source)
+        self.assertIn("llm=build_llm()", source)
+        self.assertNotIn("llm=build_dartmouth_chat_llm()", source)
         self.assertIn(
             "tools=[LOOKUP_PART_TOOL, SET_ASIDE_TOOL, TRANSFER_TO_HUMAN_TOOL]",
             source,
@@ -154,6 +158,45 @@ class T3RetrievalAgentTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
                 agent.build_dartmouth_chat_llm()
+
+    def test_build_llm_uses_groq_base_url_key_and_model(self) -> None:
+        agent = load_agent_module()
+        FakeOpenAILLM.calls.clear()
+
+        with (
+            patch.object(agent.openai, "LLM", FakeOpenAILLM),
+            patch.dict(
+                os.environ,
+                {
+                    "GROQ_API_KEY": "groq-key",
+                    "DARTMOUTH_CHAT_API_KEY": "must-not-be-used",
+                    "DARTMOUTH_CHAT_BASE_URL": "https://chat.dartmouth.example/v1",
+                    "DARTMOUTH_CHAT_MODEL": "dartmouth-gpt-4o-class",
+                    "OPENAI_API_KEY": "must-not-be-used",
+                },
+                clear=True,
+            ),
+        ):
+            llm = agent.build_llm()
+
+        self.assertIsInstance(llm, FakeOpenAILLM)
+        self.assertEqual(
+            FakeOpenAILLM.calls,
+            [
+                {
+                    "model": "llama-3.3-70b-versatile",
+                    "api_key": "groq-key",
+                    "base_url": "https://api.groq.com/openai/v1",
+                }
+            ],
+        )
+
+    def test_build_llm_refuses_missing_groq_api_key(self) -> None:
+        agent = load_agent_module()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError):
+                agent.build_llm()
 
     def test_retrieval_agent_uses_prompt_and_session_state(self) -> None:
         source = agent_source()

@@ -15,6 +15,7 @@ from agent.prompts import PARTSLINE_SYSTEM_PROMPT
 from agent import session_limits
 from agent.db import save_call
 from agent.outcome import CallOutcome
+from agent.process_lock import AgentProcessLock, AgentProcessLockError
 from agent.tools.lookup_part import lookup_part
 from agent.tools.set_aside import SetAsideResult, set_aside
 from agent.tools.transfer import TransferResult, transfer_to_human
@@ -224,7 +225,11 @@ def main() -> None:
     from livekit import agents
 
     load_dotenv()
-    agents.cli.run_app(create_server())
+    try:
+        with AgentProcessLock():
+            agents.cli.run_app(create_server())
+    except AgentProcessLockError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":

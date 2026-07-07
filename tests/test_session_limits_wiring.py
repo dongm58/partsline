@@ -37,6 +37,18 @@ class FakeSpeechHandle:
         return wait_for_playout().__await__()
 
 
+class HangingSpeechHandle(FakeSpeechHandle):
+    def __init__(self) -> None:
+        pass
+
+    def __await__(self) -> Generator[None, None, "HangingSpeechHandle"]:
+        async def never_finish() -> HangingSpeechHandle:
+            await asyncio.Future()
+            return self
+
+        return never_finish().__await__()
+
+
 class FakeAgentSession:
     def __init__(self, events: list[object]) -> None:
         self._events = events
@@ -54,6 +66,12 @@ class FakeAgentSession:
 
     async def aclose(self) -> None:
         self._events.append("session.aclose")
+
+
+class HangingClosingLineSession(FakeAgentSession):
+    def say(self, text: str, **kwargs: object) -> HangingSpeechHandle:
+        self._events.append(("session.say", text, kwargs))
+        return HangingSpeechHandle()
 
 
 class FakeRoom:
@@ -198,6 +216,37 @@ class SessionLimitsWiringTest(unittest.TestCase):
             closing_sequence,
         )
         self.assertEqual(events[-1], ("ctx.shutdown", "session limits reached"))
+
+    def test_limit_shutdown_closes_session_when_closing_line_playout_hangs(
+        self,
+    ) -> None:
+        async def run_scenario() -> list[object]:
+            agent = load_agent_module()
+            agent.CLOSING_LINE_TIMEOUT_SECONDS = 0.01
+            events: list[object] = []
+            session = HangingClosingLineSession(events)
+            context = FakeContext(events)
+
+            await asyncio.wait_for(
+                agent._shutdown_for_session_limits(session, context), timeout=0.2
+            )
+            return events
+
+        events = asyncio.run(run_scenario())
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "session.say",
+                    CLOSING_LINE,
+                    {"allow_interruptions": False},
+                ),
+                "session.aclose",
+                "room.disconnect",
+                ("ctx.shutdown", "session limits reached"),
+            ],
+        )
 
     def test_user_turn_completed_is_the_only_activity_reset_path(self) -> None:
         agent = load_agent_module()

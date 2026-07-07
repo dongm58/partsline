@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -24,6 +25,7 @@ AGENT_NAME = "partsline-retrieval"
 GREETING = "Parts counter, go ahead."
 ENDPOINTING_MIN_DELAY_SECONDS = 1.0
 ENDPOINTING_MAX_DELAY_SECONDS = 3.0
+CLOSING_LINE_TIMEOUT_SECONDS = 5.0
 SESSION_LIMIT_SHUTDOWN_REASON = "session limits reached"
 SessionLimits = session_limits.SessionLimits
 
@@ -165,8 +167,11 @@ async def _shutdown_for_session_limits(session, ctx) -> None:
     closing_playout = session.say(
         session_limits.CLOSING_LINE, allow_interruptions=False
     )
-    await closing_playout
-    LOGGER.info("closing line playout completed; closing session and room")
+    try:
+        await asyncio.wait_for(closing_playout, timeout=CLOSING_LINE_TIMEOUT_SECONDS)
+        LOGGER.info("closing line playout completed; closing session and room")
+    except asyncio.TimeoutError:
+        LOGGER.warning("closing line playout timed out; closing session and room")
     await _await_if_needed(session.aclose())
     await _await_if_needed(ctx.room.disconnect())
     await _await_if_needed(ctx.shutdown(SESSION_LIMIT_SHUTDOWN_REASON))

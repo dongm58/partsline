@@ -1,0 +1,295 @@
+"""Grounded part lookup tool backed by vehicle-filtered Moss queries."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
+
+from moss import MossClient, QueryOptions
+
+from query import INDEX_NAME, moss_credentials
+from seed import load_catalog_entries
+
+
+LookupStatus = Literal["single_match", "ambiguous", "superseded", "no_match"]
+VehicleFilter = dict[str, str]
+MossFilter = dict[str, Any]
+
+
+class MossDoc(Protocol):
+    id: str
+    text: str
+    metadata: dict[str, str]
+
+
+class QueryResult(Protocol):
+    docs: list[MossDoc]
+
+
+class SingleMatchResult(TypedDict):
+    status: Literal["single_match"]
+    part_number: str
+    price: str
+    stock: int
+
+
+class AmbiguousResult(TypedDict):
+    status: Literal["ambiguous"]
+    attribute: str
+    candidates: list[str]
+
+
+class SupersededResult(TypedDict):
+    status: Literal["superseded"]
+    old_part_number: str
+    replacement_part_number: str
+    price: str
+    stock: int
+
+
+class NoMatchResult(TypedDict):
+    status: Literal["no_match"]
+
+
+LookupResult = SingleMatchResult | AmbiguousResult | SupersededResult | NoMatchResult
+
+
+class CatalogEntry(TypedDict):
+    id: str
+    text: str
+    metadata: dict[str, str]
+
+
+class PartRecord(TypedDict):
+    part_number: str
+    price: str
+    stock: int
+    metadata: dict[str, str]
+    superseded_by: NotRequired[str]
+
+
+def normalize_part(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError("part is required")
+    return normalized
+
+
+def normalize_year(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError("year is required")
+    return normalized
+
+
+def normalize_title(value: str, field: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError(f"{field} is required")
+    return normalized.title()
+
+
+def normalize_model(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError("model is required")
+    if any(character.isdigit() for character in normalized):
+        return normalized.upper()
+    return normalized.title()
+
+
+def normalize_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = " ".join(value.strip().split())
+    return normalized or None
+
+
+def vehicle_filter(
+    *,
+    year: str,
+    make: str,
+    model: str,
+    engine: str | None = None,
+    trim: str | None = None,
+) -> VehicleFilter:
+    filters = {
+        "year": normalize_year(year),
+        "make": normalize_title(make, "make"),
+        "model": normalize_model(model),
+    }
+
+    normalized_engine = normalize_optional(engine)
+    if normalized_engine is not None:
+        filters["engine"] = normalized_engine
+
+    normalized_trim = normalize_optional(trim)
+    if normalized_trim is not None:
+        filters["trim"] = normalized_trim
+
+    return filters
+
+
+def moss_filter(filters: VehicleFilter) -> MossFilter:
+    conditions = [
+        {"field": field, "condition": {"$eq": value}}
+        for field, value in filters.items()
+    ]
+    return conditions[0] if len(conditions) == 1 else {"$and": conditions}
+
+
+def part_index() -> dict[str, PartRecord]:
+    records: dict[str, PartRecord] = {}
+    for entry in load_catalog_entries():
+        metadata = entry["metadata"]
+        part_number = metadata.get("part_number")
+        if not part_number:
+            continue
+
+        stock = int(metadata.get("stock", "0"))
+        record: PartRecord = {
+            "part_number": part_number,
+            "price": metadata["price"],
+            "stock": stock,
+            "metadata": metadata,
+        }
+        superseded_by = metadata.get("superseded_by")
+        if superseded_by:
+            record["superseded_by"] = superseded_by
+        records[part_number] = record
+
+    return records
+
+
+def get_stock(part_number: str) -> int:
+    try:
+        return part_index()[part_number]["stock"]
+    except KeyError as exc:
+        raise ValueError(f"unknown part number: {part_number}") from exc
+
+
+def current_replacement(part_number: str) -> PartRecord:
+    records = part_index()
+    current = records[part_number]
+    seen = {part_number}
+
+    while "superseded_by" in current:
+        next_part_number = current["superseded_by"]
+        if next_part_number in seen:
+            raise ValueError(f"supersession loop at part number: {next_part_number}")
+        seen.add(next_part_number)
+        current = records[next_part_number]
+
+    return current
+
+
+def matching_metadata(doc: MossDoc) -> dict[str, str]:
+    return dict(doc.metadata)
+
+
+def live_matches(docs: Iterable[MossDoc]) -> list[dict[str, str]]:
+    matches: list[dict[str, str]] = []
+    for doc in docs:
+        metadata = matching_metadata(doc)
+        if metadata.get("superseded_by"):
+            matches.append(metadata)
+            continue
+
+        if int(metadata.get("stock", "0")) == 0:
+            continue
+
+        matches.append(metadata)
+
+    return matches
+
+
+def differing_attribute(matches: list[dict[str, str]]) -> tuple[str, list[str]]:
+    for attribute in ("engine", "trim"):
+        values = sorted(
+            {
+                metadata[attribute]
+                for metadata in matches
+                if metadata.get(attribute) is not None
+            }
+        )
+        if len(values) > 1:
+            return attribute, values
+
+    part_numbers = sorted({metadata["part_number"] for metadata in matches})
+    return "part_number", part_numbers
+
+
+def format_single_match(metadata: dict[str, str]) -> SingleMatchResult:
+    part_number = metadata["part_number"]
+    return {
+        "status": "single_match",
+        "part_number": part_number,
+        "price": metadata["price"],
+        "stock": get_stock(part_number),
+    }
+
+
+def format_superseded(metadata: dict[str, str]) -> SupersededResult:
+    old_part_number = metadata["part_number"]
+    replacement = current_replacement(old_part_number)
+    replacement_part_number = replacement["part_number"]
+    return {
+        "status": "superseded",
+        "old_part_number": old_part_number,
+        "replacement_part_number": replacement_part_number,
+        "price": replacement["price"],
+        "stock": get_stock(replacement_part_number),
+    }
+
+
+async def filtered_moss_query(part: str, filters: VehicleFilter) -> list[MossDoc]:
+    client = MossClient(*moss_credentials())
+    await client.load_index(INDEX_NAME)
+    result = cast(
+        QueryResult,
+        await client.query(
+            INDEX_NAME,
+            part,
+            QueryOptions(top_k=10, alpha=0.8, filter=moss_filter(filters)),
+        ),
+    )
+    return result.docs
+
+
+async def lookup_part(
+    part: str,
+    year: str,
+    make: str,
+    model: str,
+    engine: str | None = None,
+    trim: str | None = None,
+) -> LookupResult:
+    normalized_part = normalize_part(part)
+    filters = vehicle_filter(
+        year=year, make=make, model=model, engine=engine, trim=trim
+    )
+    docs = await filtered_moss_query(normalized_part, filters)
+
+    if not docs:
+        return {"status": "no_match"}
+
+    matches = live_matches(docs)
+    if not matches:
+        return {"status": "no_match"}
+
+    superseded_matches = [
+        metadata for metadata in matches if metadata.get("superseded_by")
+    ]
+    if superseded_matches:
+        return format_superseded(superseded_matches[0])
+
+    if len(matches) > 1:
+        attribute, candidates = differing_attribute(matches)
+        return {
+            "status": "ambiguous",
+            "attribute": attribute,
+            "candidates": candidates,
+        }
+
+    return format_single_match(matches[0])

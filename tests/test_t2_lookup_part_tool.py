@@ -155,6 +155,7 @@ class T2LookupPartToolTest(unittest.TestCase):
                 "year": "2014",
                 "make": "Subaru",
                 "model": "Outback",
+                "category": "belts",
             },
         )
 
@@ -179,6 +180,7 @@ class T2LookupPartToolTest(unittest.TestCase):
                 "year": "2019",
                 "make": "Toyota",
                 "model": "RAV4",
+                "category": "brakes",
             },
         )
 

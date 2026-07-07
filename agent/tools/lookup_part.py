@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 
@@ -14,6 +15,18 @@ from seed import load_catalog_entries
 LookupStatus = Literal["single_match", "ambiguous", "superseded", "no_match"]
 VehicleFilter = dict[str, str]
 MossFilter = dict[str, Any]
+
+
+# Maps a spoken part phrase to a catalog category. Keyed by the category value
+# stored in the catalog metadata; values are substrings to look for in the
+# caller's requested part text. First match wins.
+PART_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "belts": ("belt",),
+    "brakes": ("brake", "pad", "rotor", "caliper"),
+    "filters": ("filter",),
+    "batteries": ("battery", "batteries"),
+    "wipers": ("wiper", "blade"),
+}
 
 
 class MossDoc(Protocol):
@@ -75,6 +88,20 @@ def normalize_part(value: str) -> str:
     return normalized
 
 
+def infer_category(part: str) -> str | None:
+    """Derive the catalog category from the requested part text.
+
+    "serpentine belt" -> "belts", "oil filter" -> "filters",
+    "brake pads" -> "brakes". Returns None when nothing matches, in which
+    case the lookup falls back to vehicle-only filtering.
+    """
+    text = part.lower()
+    for category, keywords in PART_CATEGORY_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return category
+    return None
+
+
 def normalize_year(value: str) -> str:
     normalized = " ".join(value.strip().split())
     if not normalized:
@@ -103,6 +130,12 @@ def normalize_optional(value: str | None) -> str | None:
         return None
 
     normalized = " ".join(value.strip().split())
+    # Strip engine unit noise: "2.5 liter", "2.5-liter", "2.5L" -> "2.5"
+    # This handles the case where the LLM transcribes "two point five liter" from speech
+    normalized = re.sub(
+        r"[\s-]*(?:liter|litre|l)\b", "", normalized, flags=re.IGNORECASE
+    )
+    normalized = normalized.strip()
     return normalized or None
 
 
@@ -269,12 +302,28 @@ async def lookup_part(
     filters = vehicle_filter(
         year=year, make=make, model=model, engine=engine, trim=trim
     )
+
+    # Constrain by part category so a vehicle that has parts of other
+    # categories can never return the wrong part type. A belt request must
+    # never come back as a filter.
+    category = infer_category(normalized_part)
+    if category is not None:
+        filters["category"] = category
+
     docs = await filtered_moss_query(normalized_part, filters)
 
     if not docs:
         return {"status": "no_match"}
 
     matches = live_matches(docs)
+
+    # Safety net: even if the category filter let something through, drop any
+    # match whose category doesn't match what was asked for.
+    if category is not None:
+        matches = [
+            metadata for metadata in matches if metadata.get("category") == category
+        ]
+
     if not matches:
         return {"status": "no_match"}
 

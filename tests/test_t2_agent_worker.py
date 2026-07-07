@@ -77,7 +77,7 @@ class FakeJobContext:
         self.shutdown_callbacks.append(callback)
 
 
-class T2AgentWorkerTest(unittest.TestCase):
+class T2AgentTest(unittest.TestCase):
     def test_agent_files_exist(self) -> None:
         self.assertTrue(AGENT_MAIN.exists())
         self.assertTrue(AGENT_REQUIREMENTS.exists())

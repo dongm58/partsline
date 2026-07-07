@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 from collections.abc import Awaitable
@@ -11,6 +12,7 @@ from livekit.plugins import cartesia, deepgram, openai, silero
 
 from agent.prompts import PARTSLINE_SYSTEM_PROMPT
 from agent import session_limits
+from agent.db import save_call
 from agent.outcome import CallOutcome
 from agent.tools.lookup_part import lookup_part
 from agent.tools.set_aside import SetAsideResult, set_aside
@@ -133,6 +135,31 @@ async def _await_if_needed(result: object) -> None:
         await cast(Awaitable[object], result)
 
 
+def _call_outcome_for_session(session: object) -> CallOutcome | None:
+    userdata = getattr(session, "userdata", None)
+    outcome = getattr(userdata, "call_outcome", None)
+    if isinstance(outcome, CallOutcome):
+        return outcome
+    return None
+
+
+async def emit_call_ended(room: object, outcome: CallOutcome) -> None:
+    participant = getattr(room, "local_participant", None)
+    publish_data = getattr(participant, "publish_data", None)
+    if publish_data is None:
+        return
+
+    payload = json.dumps(
+        {
+            "call_id": outcome.call_id,
+            "outcome": outcome.outcome,
+        },
+        separators=(",", ":"),
+    )
+    result = publish_data(payload, reliable=True, topic="call_ended")
+    await _await_if_needed(result)
+
+
 async def _shutdown_for_session_limits(session, ctx) -> None:
     LOGGER.info("session limit reached; speaking closing line")
     closing_playout = session.say(
@@ -160,10 +187,15 @@ async def run_retrieval_session(ctx) -> None:
     agent.session_limits = limits
     limits.start()
 
-    async def stop_session_limits(_: str = "") -> None:
+    async def finish_call(_: str = "") -> None:
         await limits.stop()
+        outcome = _call_outcome_for_session(session)
+        if outcome is None:
+            return
+        save_call(outcome)
+        await emit_call_ended(ctx.room, outcome)
 
-    ctx.add_shutdown_callback(stop_session_limits)
+    ctx.add_shutdown_callback(finish_call)
     LOGGER.info("session started; speaking greeting", extra={"greeting": GREETING})
     await session.say(GREETING, allow_interruptions=True)
     LOGGER.info("greeting speak call completed")

@@ -10,6 +10,11 @@ type TokenResponse = {
   participant_token: string;
 };
 
+type CallEndedPayload = {
+  call_id: string;
+  outcome: string;
+};
+
 type TranscriptItem =
   | {
       id: string;
@@ -21,6 +26,11 @@ type TranscriptItem =
       id: string;
       kind: "lookup_chip";
       chip: LookupChipPayload;
+    }
+  | {
+      id: string;
+      kind: "call_ended";
+      event: CallEndedPayload;
     };
 
 type UnknownRecord = Record<string, unknown>;
@@ -39,6 +49,7 @@ const AUDIO_CAPTURE_OPTIONS: AudioCaptureOptions = {
 };
 
 const LOOKUP_CHIP_TOPIC = "lookup_chip";
+const CALL_ENDED_TOPIC = "call_ended";
 
 const LOOKUP_CHIP_RESULTS = new Set<LookupChipResult>([
   "single",
@@ -67,6 +78,14 @@ function isLookupChipPayload(value: unknown): value is LookupChipPayload {
   );
 }
 
+function isCallEndedPayload(value: unknown): value is CallEndedPayload {
+  return (
+    isRecord(value) &&
+    typeof value.call_id === "string" &&
+    typeof value.outcome === "string"
+  );
+}
+
 function parseLookupChipPayload(payload: Uint8Array) {
   try {
     const decoded = new TextDecoder().decode(payload);
@@ -75,6 +94,20 @@ function parseLookupChipPayload(payload: Uint8Array) {
   } catch {
     return null;
   }
+}
+
+function parseCallEndedPayload(payload: Uint8Array) {
+  try {
+    const decoded = new TextDecoder().decode(payload);
+    const parsed = JSON.parse(decoded);
+    return isCallEndedPayload(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatOutcome(outcome: string) {
+  return outcome.replaceAll("_", " ");
 }
 
 async function unlockBrowserAudio() {
@@ -122,16 +155,33 @@ export default function PartsLineDemoClient() {
       resetConnectionState();
     };
 
-    const handleLookupChipData = (
+    const handleProofLayerData = (
       payload: Uint8Array,
       _participant?: unknown,
       _kind?: unknown,
       topic?: string,
     ) => {
-      if (topic !== LOOKUP_CHIP_TOPIC) {
+      if (topic === CALL_ENDED_TOPIC) {
+        const event = parseCallEndedPayload(payload);
+        if (!event) {
+          return;
+        }
+
+        setStatus("Ended");
+        setTranscriptItems((current) => [
+          ...current,
+          {
+            id: `${Date.now()}-${current.length}`,
+            kind: "call_ended",
+            event,
+          },
+        ]);
         return;
       }
 
+      if (topic !== LOOKUP_CHIP_TOPIC) {
+        return;
+      }
       const chip = parseLookupChipPayload(payload);
       if (!chip) {
         return;
@@ -149,12 +199,12 @@ export default function PartsLineDemoClient() {
 
     room.on(RoomEvent.Disconnected, resetConnectionState);
     room.on(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
-    room.on(RoomEvent.DataReceived, handleLookupChipData);
+    room.on(RoomEvent.DataReceived, handleProofLayerData);
 
     return () => {
       room.off(RoomEvent.Disconnected, resetConnectionState);
       room.off(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
-      room.off(RoomEvent.DataReceived, handleLookupChipData);
+      room.off(RoomEvent.DataReceived, handleProofLayerData);
       void room.disconnect();
     };
   }, [room]);
@@ -246,7 +296,20 @@ export default function PartsLineDemoClient() {
           ) : (
             <ol style={styles.transcriptList}>
               {transcriptLines.map((item) =>
-                item.kind === "lookup_chip" ? (
+                item.kind === "call_ended" ? (
+                  <li key={item.id} style={styles.callEndedLine}>
+                    <span style={styles.callEndedLabel}>Call ended</span>
+                    <span style={styles.callEndedOutcome}>
+                      {formatOutcome(item.event.outcome)}
+                    </span>
+                    <span style={styles.callEndedId}>
+                      {item.event.call_id}
+                    </span>
+                    <a href="/calls" style={styles.callLogLink}>
+                      View call log
+                    </a>
+                  </li>
+                ) : item.kind === "lookup_chip" ? (
                   <li key={item.id} style={styles.lookupChipLine}>
                     <LookupChip chip={item.chip} />
                   </li>
@@ -375,6 +438,31 @@ const styles = {
   },
   lookupChipLine: {
     listStyle: "none",
+  },
+  callEndedLine: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: "10px",
+    padding: "12px",
+    border: "1px solid #c9d5df",
+    borderRadius: "6px",
+    background: "#eef3f6",
+    fontSize: "14px",
+  },
+  callEndedLabel: {
+    fontWeight: 700,
+  },
+  callEndedOutcome: {
+    color: "#324656",
+    textTransform: "capitalize" as const,
+  },
+  callEndedId: {
+    color: "#65717c",
+  },
+  callLogLink: {
+    color: "#126b58",
+    fontWeight: 700,
   },
   transcriptState: {
     color: "#486577",

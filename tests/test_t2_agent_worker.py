@@ -163,7 +163,10 @@ class T2AgentWorkerTest(unittest.TestCase):
         self.assertIn("silero.VAD.load()", source)
         self.assertIn("inference.TurnDetector()", source)
         self.assertIn("llm=build_dartmouth_chat_llm()", source)
-        self.assertIn("tools=[LOOKUP_PART_TOOL]", source)
+        self.assertIn(
+            "tools=[LOOKUP_PART_TOOL, SET_ASIDE_TOOL, TRANSFER_TO_HUMAN_TOOL]",
+            source,
+        )
         self.assertIn("userdata=PartsLineSessionState()", source)
         self.assertIn("session.say(GREETING, allow_interruptions=True)", source)
         self.assertIn("TurnHandlingOptions(", source)

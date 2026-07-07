@@ -6,12 +6,15 @@ import os
 from collections.abc import Awaitable
 from typing import cast
 
-from livekit.agents import Agent, function_tool, llm
+from livekit.agents import Agent, RunContext, function_tool, llm
 from livekit.plugins import cartesia, deepgram, openai, silero
 
 from agent.prompts import PARTSLINE_SYSTEM_PROMPT
 from agent import session_limits
+from agent.outcome import CallOutcome
 from agent.tools.lookup_part import lookup_part
+from agent.tools.set_aside import SetAsideResult, set_aside
+from agent.tools.transfer import TransferResult, transfer_to_human
 
 
 LOGGER = logging.getLogger(__name__)
@@ -35,6 +38,41 @@ LOOKUP_PART_TOOL = function_tool(
 class PartsLineSessionState:
     def __init__(self) -> None:
         self.captured_vehicle: dict[str, str] = {}
+        self.call_outcome = CallOutcome()
+
+
+async def set_aside_for_session(
+    ctx: RunContext[PartsLineSessionState],
+    first_name: str,
+    part_number: str,
+    quantity: int = 1,
+) -> SetAsideResult:
+    return set_aside(ctx.userdata.call_outcome, first_name, part_number, quantity)
+
+
+async def transfer_to_human_for_session(
+    ctx: RunContext[PartsLineSessionState], reason: str
+) -> TransferResult:
+    return transfer_to_human(ctx.userdata.call_outcome, reason)
+
+
+SET_ASIDE_TOOL = function_tool(
+    set_aside_for_session,
+    name="set_aside",
+    description=(
+        "Hold a quoted, in-stock part under the caller's first name. "
+        "Rejects parts not quoted this call or parts with no stock."
+    ),
+)
+
+TRANSFER_TO_HUMAN_TOOL = function_tool(
+    transfer_to_human_for_session,
+    name="transfer_to_human",
+    description=(
+        "Simulate a warm transfer to a human and return a transfer event "
+        "with the captured vehicle and part context."
+    ),
+)
 
 
 def required_env(name: str) -> str:
@@ -72,7 +110,7 @@ def build_session():
         llm=build_dartmouth_chat_llm(),
         tts=cartesia.TTS(model="sonic-3"),
         vad=silero.VAD.load(),
-        tools=[LOOKUP_PART_TOOL],
+        tools=[LOOKUP_PART_TOOL, SET_ASIDE_TOOL, TRANSFER_TO_HUMAN_TOOL],
         userdata=PartsLineSessionState(),
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(),

@@ -88,18 +88,30 @@ class T3RetrievalAgentTest(unittest.TestCase):
         self.assertIn("DARTMOUTH_CHAT_MODEL=", env_template)
         self.assertNotIn("OPENAI_API_KEY", env_template)
 
-    def test_agent_session_wires_openai_llm_and_only_lookup_tool(self) -> None:
+    def test_agent_session_wires_openai_llm_and_tools(self) -> None:
         source = agent_source()
 
         self.assertIn(
             "from livekit.plugins import cartesia, deepgram, openai, silero", source
         )
         self.assertIn("from agent.tools.lookup_part import lookup_part", source)
+        self.assertIn(
+            "from agent.tools.set_aside import SetAsideResult, set_aside", source
+        )
+        self.assertIn(
+            "from agent.tools.transfer import TransferResult, transfer_to_human",
+            source,
+        )
         self.assertIn("from agent.prompts import PARTSLINE_SYSTEM_PROMPT", source)
         self.assertIn("function_tool(", source)
         self.assertIn("lookup_part,", source)
+        self.assertIn("set_aside_for_session,", source)
+        self.assertIn("transfer_to_human_for_session,", source)
         self.assertIn("build_dartmouth_chat_llm", source)
-        self.assertIn("tools=[LOOKUP_PART_TOOL]", source)
+        self.assertIn(
+            "tools=[LOOKUP_PART_TOOL, SET_ASIDE_TOOL, TRANSFER_TO_HUMAN_TOOL]",
+            source,
+        )
         self.assertNotIn("api.openai.com", source)
         self.assertNotIn("OPENAI_API_KEY", source)
         self.assertNotIn("VoicePipelineAgent", source)

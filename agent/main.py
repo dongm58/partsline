@@ -212,6 +212,106 @@ TRANSFER_TO_HUMAN_TOOL = function_tool(
 )
 
 
+TURN_METRICS_LOG_EVENT = "partsline_turn_metrics"
+
+
+def _numeric_metric(metrics: object, key: str) -> float | None:
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
+def _chat_item_type(item: object) -> object:
+    return getattr(item, "type", None)
+
+
+def _is_assistant_message(item: object) -> bool:
+    return (
+        _chat_item_type(item) == "message"
+        and getattr(item, "role", None) == "assistant"
+    )
+
+
+def _assistant_message_for_turn(chat_items: list[object]) -> object | None:
+    for item in reversed(chat_items):
+        if _is_assistant_message(item):
+            return item
+    return None
+
+
+def _log_turn_metrics(
+    speech_handle: object, llm_generation_times: dict[str, float]
+) -> None:
+    chat_items = list(getattr(speech_handle, "chat_items", []))
+    assistant_message = _assistant_message_for_turn(chat_items)
+    if assistant_message is None:
+        return
+
+    metrics = getattr(assistant_message, "metrics", {})
+    speech_id = getattr(speech_handle, "id", None)
+    llm_generation_time = (
+        llm_generation_times.pop(speech_id, None)
+        if isinstance(speech_id, str)
+        else None
+    )
+    payload = {
+        "event": TURN_METRICS_LOG_EVENT,
+        "llm_time_to_first_token_seconds": _numeric_metric(metrics, "llm_node_ttft"),
+        "llm_total_generation_seconds": llm_generation_time,
+        "tool_call_happened": any(
+            _chat_item_type(item) == "function_call" for item in chat_items
+        ),
+        "tts_time_to_first_byte_seconds": _numeric_metric(metrics, "tts_node_ttfb"),
+        "turn_latency_to_first_audio_seconds": _numeric_metric(metrics, "e2e_latency"),
+    }
+    LOGGER.info(
+        "%s %s",
+        TURN_METRICS_LOG_EVENT,
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+    )
+
+
+def register_turn_metrics_logging(session: object) -> None:
+    llm_generation_times: dict[str, float] = {}
+
+    def on_metrics_collected(event: object) -> None:
+        metrics = getattr(event, "metrics", None)
+        if getattr(metrics, "type", None) != "llm_metrics":
+            return
+
+        speech_id = getattr(metrics, "speech_id", None)
+        duration = getattr(metrics, "duration", None)
+        if (
+            isinstance(speech_id, str)
+            and not isinstance(duration, bool)
+            and isinstance(duration, int | float)
+        ):
+            llm_generation_times[speech_id] = float(duration)
+
+    def on_speech_created(event: object) -> None:
+        if getattr(event, "source", None) != "generate_reply":
+            return
+
+        speech_handle = getattr(event, "speech_handle", None)
+        add_done_callback = getattr(speech_handle, "add_done_callback", None)
+        if not callable(add_done_callback):
+            return
+
+        def on_speech_done(done_handle: object) -> None:
+            _log_turn_metrics(done_handle, llm_generation_times)
+
+        add_done_callback(on_speech_done)
+
+    on = getattr(session, "on")
+    on("metrics_collected", on_metrics_collected)
+    on("speech_created", on_speech_created)
+
+
 def required_env(name: str, config_name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -250,7 +350,7 @@ class PartsLineAgent(Agent):
 def build_session():
     from livekit.agents import AgentSession, TurnHandlingOptions, inference
 
-    return AgentSession(
+    session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="en"),
         llm=build_llm(),
         tts=cartesia.TTS(model="sonic-3"),
@@ -267,6 +367,8 @@ def build_session():
             interruption={"enabled": True, "mode": "adaptive"},
         ),
     )
+    register_turn_metrics_logging(session)
+    return session
 
 
 def build_agent() -> PartsLineAgent:

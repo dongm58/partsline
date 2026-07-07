@@ -104,21 +104,28 @@ class T2AgentTest(unittest.TestCase):
     def test_run_retrieval_session_starts_partsline_agent_and_speaks_greeting(
         self,
     ) -> None:
-        async def run_scenario() -> FakeAgentSession:
+        async def run_scenario() -> tuple[FakeAgentSession, list[str]]:
             agent = load_agent_module()
             session = FakeAgentSession()
             retrieval_agent = agent.PartsLineAgent()
             context = FakeJobContext()
+            warmups: list[str] = []
+
+            async def fake_warm_moss_client_cache() -> None:
+                warmups.append("warmup")
+
             agent.build_session = lambda: session
             agent.build_agent = lambda: retrieval_agent
+            agent.warm_moss_client_cache = fake_warm_moss_client_cache
 
             await agent.run_retrieval_session(context)
             await context.shutdown_callbacks[0]("test shutdown")
-            return session
+            return session, warmups
 
-        session = asyncio.run(run_scenario())
+        session, warmups = asyncio.run(run_scenario())
 
         self.assertTrue(session.started)
+        self.assertEqual(warmups, ["warmup"])
         self.assertEqual(
             session.start_kwargs["agent"].__class__.__name__, "PartsLineAgent"
         )

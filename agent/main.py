@@ -24,6 +24,7 @@ from agent.tools.lookup_part import (
     SupersededResult,
     lookup_part,
     part_index,
+    warm_moss_client_cache,
 )
 from agent.tools.set_aside import SetAsideResult, set_aside
 from agent.tools.transfer import TransferResult, transfer_to_human
@@ -626,6 +627,13 @@ async def _shutdown_for_session_limits(session, ctx) -> None:
     await _await_if_needed(ctx.shutdown(SESSION_LIMIT_SHUTDOWN_REASON))
 
 
+async def _warm_lookup_index_for_session() -> None:
+    try:
+        await warm_moss_client_cache()
+    except Exception:
+        LOGGER.warning("Moss cache warmup failed; lookup_part will retry on demand")
+
+
 async def run_retrieval_session(ctx) -> None:
     session = build_session()
     agent = build_agent()
@@ -650,6 +658,7 @@ async def run_retrieval_session(ctx) -> None:
         await emit_call_ended(ctx.room, outcome)
 
     ctx.add_shutdown_callback(finish_call)
+    await _warm_lookup_index_for_session()
     LOGGER.info("session started; speaking greeting", extra={"greeting": GREETING})
     await session.say(GREETING, allow_interruptions=True)
     LOGGER.info("greeting speak call completed")

@@ -146,9 +146,13 @@ class SessionLimitsWiringTest(unittest.TestCase):
                 limits.events = events
                 return limits
 
+            async def skip_warmup() -> None:
+                pass
+
             agent.build_session = lambda: session
             agent.build_agent = lambda: retrieval_agent
             agent.SessionLimits = build_limits
+            agent.warm_moss_client_cache = skip_warmup
 
             await agent.run_retrieval_session(context)
             await context.shutdown_callbacks[0]("normal room shutdown")
@@ -188,9 +192,13 @@ class SessionLimitsWiringTest(unittest.TestCase):
                 limits.events = events
                 return limits
 
+            async def skip_warmup() -> None:
+                pass
+
             agent.build_session = lambda: session
             agent.build_agent = lambda: retrieval_agent
             agent.SessionLimits = build_limits
+            agent.warm_moss_client_cache = skip_warmup
 
             await agent.run_retrieval_session(context)
             limits = FakeSessionLimits.instances[0]

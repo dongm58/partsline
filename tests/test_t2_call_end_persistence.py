@@ -99,6 +99,11 @@ class T2CallEndPersistenceTest(unittest.TestCase):
             agent.build_agent = agent.PartsLineAgent
             agent.save_call = fake_save_call
 
+            async def skip_warmup() -> None:
+                pass
+
+            agent.warm_moss_client_cache = skip_warmup
+
             await agent.run_retrieval_session(context)
             state.call_outcome.call_id = "call-t2"
             state.call_outcome.set_final_outcome("no_match")

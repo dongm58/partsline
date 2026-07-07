@@ -101,6 +101,7 @@ def flatten_filter(filter_obj: JsonObject) -> dict[str, str]:
 
 def run_lookup(**kwargs: str) -> tuple[dict[str, object], FakeMossClient]:
     lookup_part_module = importlib.import_module("agent.tools.lookup_part")
+    lookup_part_module.reset_moss_client_cache()
     FakeMossClient.instances.clear()
 
     with (
@@ -119,6 +120,11 @@ def run_lookup(**kwargs: str) -> tuple[dict[str, object], FakeMossClient]:
 
 
 class T2LookupPartToolTest(unittest.TestCase):
+    def setUp(self) -> None:
+        lookup_part_module = importlib.import_module("agent.tools.lookup_part")
+        lookup_part_module.reset_moss_client_cache()
+        FakeMossClient.instances.clear()
+
     def test_dual_engine_vehicle_returns_ambiguous_and_uses_vehicle_filter(
         self,
     ) -> None:
@@ -229,6 +235,46 @@ class T2LookupPartToolTest(unittest.TestCase):
                 "stock": 6,
             },
         )
+
+    def test_sequential_lookups_reuse_loaded_moss_client(self) -> None:
+        FakeMossClient.docs = [catalog_doc("pads-camry")]
+        lookup_part_module = importlib.import_module("agent.tools.lookup_part")
+        FakeMossClient.instances.clear()
+
+        async def run_two_lookups() -> tuple[object, object]:
+            first = await lookup_part_module.lookup_part(
+                part="front brake pads",
+                year="2015",
+                make="Toyota",
+                model="Camry",
+                engine="2.5",
+            )
+            second = await lookup_part_module.lookup_part(
+                part="front brake pads",
+                year="2015",
+                make="Toyota",
+                model="Camry",
+                engine="2.5",
+            )
+            return first, second
+
+        with (
+            patch.object(lookup_part_module, "MossClient", FakeMossClient),
+            patch.dict(
+                os.environ,
+                {
+                    "MOSS_PROJECT": "test-project",
+                    "MOSS_API_KEY": "test-key",
+                },
+            ),
+        ):
+            first, second = asyncio.run(run_two_lookups())
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(FakeMossClient.instances), 1)
+        client = FakeMossClient.instances[0]
+        self.assertEqual(client.loaded_indexes, ["parts-catalog-test"])
+        self.assertEqual(len(client.queries), 2)
 
     def test_missing_required_vehicle_attribute_refuses_before_querying(self) -> None:
         FakeMossClient.docs = [catalog_doc("pads-camry")]

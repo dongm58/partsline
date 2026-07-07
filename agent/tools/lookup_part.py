@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Iterable
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
@@ -37,6 +38,14 @@ class MossDoc(Protocol):
 
 class QueryResult(Protocol):
     docs: list[MossDoc]
+
+
+class MossLookupClient(Protocol):
+    async def load_index(self, index_name: str) -> object: ...
+
+    async def query(
+        self, index_name: str, text: str, options: QueryOptions
+    ) -> object: ...
 
 
 class SingleMatchResult(TypedDict):
@@ -79,6 +88,43 @@ class PartRecord(TypedDict):
     stock: int
     metadata: dict[str, str]
     superseded_by: NotRequired[str]
+
+
+_moss_client_cache: MossLookupClient | None = None
+_moss_client_cache_lock: asyncio.Lock | None = None
+
+
+def reset_moss_client_cache() -> None:
+    global _moss_client_cache, _moss_client_cache_lock
+    _moss_client_cache = None
+    _moss_client_cache_lock = None
+
+
+def _moss_client_lock() -> asyncio.Lock:
+    global _moss_client_cache_lock
+    if _moss_client_cache_lock is None:
+        _moss_client_cache_lock = asyncio.Lock()
+    return _moss_client_cache_lock
+
+
+async def _loaded_moss_client() -> MossLookupClient:
+    global _moss_client_cache
+
+    if _moss_client_cache is not None:
+        return _moss_client_cache
+
+    async with _moss_client_lock():
+        if _moss_client_cache is None:
+            client = MossClient(*moss_credentials())
+            await client.load_index(INDEX_NAME)
+            _moss_client_cache = client
+
+    assert _moss_client_cache is not None
+    return _moss_client_cache
+
+
+async def warm_moss_client_cache() -> None:
+    await _loaded_moss_client()
 
 
 def normalize_part(value: str) -> str:
@@ -277,8 +323,7 @@ def format_superseded(metadata: dict[str, str]) -> SupersededResult:
 
 
 async def filtered_moss_query(part: str, filters: VehicleFilter) -> list[MossDoc]:
-    client = MossClient(*moss_credentials())
-    await client.load_index(INDEX_NAME)
+    client = await _loaded_moss_client()
     result = cast(
         QueryResult,
         await client.query(

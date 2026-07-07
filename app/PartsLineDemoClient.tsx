@@ -3,17 +3,29 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { RoomAudioRenderer, RoomContext } from "@livekit/components-react";
 import { Room, RoomEvent, type AudioCaptureOptions } from "livekit-client";
+import LookupChip, { type LookupChipPayload } from "./LookupChip";
 
 type TokenResponse = {
   server_url: string;
   participant_token: string;
 };
 
-type TranscriptLine = {
-  id: string;
-  isFinal: boolean;
-  text: string;
-};
+type TranscriptItem =
+  | {
+      id: string;
+      kind: "transcript";
+      isFinal: boolean;
+      text: string;
+    }
+  | {
+      id: string;
+      kind: "lookup_chip";
+      chip: LookupChipPayload;
+    };
+
+type UnknownRecord = Record<string, unknown>;
+
+type LookupChipResult = LookupChipPayload["result"];
 
 type AudioWindow = Window &
   typeof globalThis & {
@@ -26,8 +38,43 @@ const AUDIO_CAPTURE_OPTIONS: AudioCaptureOptions = {
   autoGainControl: true,
 };
 
+const LOOKUP_CHIP_TOPIC = "lookup_chip";
+
+const LOOKUP_CHIP_RESULTS = new Set<LookupChipResult>([
+  "single",
+  "ambiguous",
+  "superseded",
+  "no_match",
+]);
+
 function uniqueName(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
+}
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null;
+}
+
+function isLookupChipPayload(value: unknown): value is LookupChipPayload {
+  if (!isRecord(value) || !isRecord(value.filter)) {
+    return false;
+  }
+
+  return (
+    typeof value.result === "string" &&
+    LOOKUP_CHIP_RESULTS.has(value.result as LookupChipResult) &&
+    Array.isArray(value.parts)
+  );
+}
+
+function parseLookupChipPayload(payload: Uint8Array) {
+  try {
+    const decoded = new TextDecoder().decode(payload);
+    const parsed = JSON.parse(decoded);
+    return isLookupChipPayload(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 async function unlockBrowserAudio() {
@@ -57,7 +104,8 @@ async function requestMicrophoneAccess() {
 export default function PartsLineDemoClient() {
   const [room, setRoom] = useState<Room | null>(null);
   const [status, setStatus] = useState("Idle");
-  const [transcriptLines, setTranscriptLines] = useState<TranscriptLine[]>([]);
+  const [transcriptItems, setTranscriptItems] = useState<TranscriptItem[]>([]);
+  const transcriptLines = transcriptItems.map((item) => item);
 
   useEffect(() => {
     if (!room) {
@@ -74,12 +122,39 @@ export default function PartsLineDemoClient() {
       resetConnectionState();
     };
 
+    const handleLookupChipData = (
+      payload: Uint8Array,
+      _participant?: unknown,
+      _kind?: unknown,
+      topic?: string,
+    ) => {
+      if (topic !== LOOKUP_CHIP_TOPIC) {
+        return;
+      }
+
+      const chip = parseLookupChipPayload(payload);
+      if (!chip) {
+        return;
+      }
+
+      setTranscriptItems((current) => [
+        ...current,
+        {
+          id: `${Date.now()}-${current.length}`,
+          kind: "lookup_chip",
+          chip,
+        },
+      ]);
+    };
+
     room.on(RoomEvent.Disconnected, resetConnectionState);
     room.on(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
+    room.on(RoomEvent.DataReceived, handleLookupChipData);
 
     return () => {
       room.off(RoomEvent.Disconnected, resetConnectionState);
       room.off(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
+      room.off(RoomEvent.DataReceived, handleLookupChipData);
       void room.disconnect();
     };
   }, [room]);
@@ -119,10 +194,11 @@ export default function PartsLineDemoClient() {
       const attributes = reader.info.attributes ?? {};
       const isFinal = attributes["lk.transcription_final"] === "true";
 
-      setTranscriptLines((current) => [
+      setTranscriptItems((current) => [
         ...current,
         {
           id: `${Date.now()}-${current.length}`,
+          kind: "transcript",
           isFinal,
           text,
         },
@@ -169,14 +245,20 @@ export default function PartsLineDemoClient() {
             <p style={styles.emptyTranscript}>No transcript yet.</p>
           ) : (
             <ol style={styles.transcriptList}>
-              {transcriptLines.map((line) => (
-                <li key={line.id} style={styles.transcriptLine}>
-                  <span style={styles.transcriptState}>
-                    {line.isFinal ? "Final" : "Interim"}
-                  </span>
-                  <span>{line.text}</span>
-                </li>
-              ))}
+              {transcriptLines.map((item) =>
+                item.kind === "lookup_chip" ? (
+                  <li key={item.id} style={styles.lookupChipLine}>
+                    <LookupChip chip={item.chip} />
+                  </li>
+                ) : (
+                  <li key={item.id} style={styles.transcriptLine}>
+                    <span style={styles.transcriptState}>
+                      {item.isFinal ? "Final" : "Interim"}
+                    </span>
+                    <span>{item.text}</span>
+                  </li>
+                ),
+              )}
             </ol>
           )}
         </section>
@@ -290,6 +372,9 @@ const styles = {
     background: "#f7fafb",
     fontSize: "15px",
     lineHeight: 1.45,
+  },
+  lookupChipLine: {
+    listStyle: "none",
   },
   transcriptState: {
     color: "#486577",

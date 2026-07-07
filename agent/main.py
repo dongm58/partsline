@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable
+from time import perf_counter
 from typing import cast
 
 from livekit.agents import Agent, RunContext, function_tool, llm
@@ -37,6 +38,7 @@ CLOSING_LINE_TIMEOUT_SECONDS = 5.0
 SESSION_LIMIT_SHUTDOWN_REASON = "session limits reached"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "llama-3.3-70b-versatile"
+TOOL_TIMING_LOG_EVENT = "partsline_tool_timing"
 SessionLimits = session_limits.SessionLimits
 
 
@@ -64,10 +66,16 @@ async def lookup_part_for_session(
     engine: str | None = None,
     trim: str | None = None,
 ) -> object:
+    total_start = perf_counter()
+    stages: dict[str, float] = {}
+
+    stage_start = perf_counter()
     result = await lookup_part(
         part=part, year=year, make=make, model=model, engine=engine, trim=trim
     )
+    stages["lookup_part_seconds"] = _elapsed_since(stage_start)
 
+    stage_start = perf_counter()
     outcome = ctx.userdata.call_outcome
     outcome.record_vehicle(year=year, make=make, model=model, engine=engine, trim=trim)
 
@@ -94,7 +102,9 @@ async def lookup_part_for_session(
         )
     elif status == "no_match":
         outcome.set_final_outcome("no_match")
+    stages["outcome_recording_seconds"] = _elapsed_since(stage_start)
 
+    stage_start = perf_counter()
     await emit_lookup_chip(
         ctx,
         result=result,
@@ -103,6 +113,13 @@ async def lookup_part_for_session(
         model=model,
         engine=engine,
         trim=trim,
+    )
+    stages["lookup_chip_emit_seconds"] = _elapsed_since(stage_start)
+    _log_tool_timing(
+        tool_name="lookup_part",
+        total_start=total_start,
+        stages=stages,
+        result_status=status if isinstance(status, str) else None,
     )
 
     return result
@@ -164,6 +181,10 @@ async def set_aside_for_session(
     part_number: str,
     quantity: object = 1,
 ) -> SetAsideResult:
+    total_start = perf_counter()
+    stages: dict[str, float] = {}
+
+    stage_start = perf_counter()
     outcome = ctx.userdata.call_outcome
     quoted = next(
         (
@@ -174,14 +195,46 @@ async def set_aside_for_session(
         None,
     )
     available = quoted["stock"] if quoted else 0
+    stages["quote_lookup_seconds"] = _elapsed_since(stage_start)
+
+    stage_start = perf_counter()
     parsed_quantity = parse_quantity(quantity, available)
-    return set_aside(outcome, first_name, part_number, parsed_quantity)
+    stages["quantity_parse_seconds"] = _elapsed_since(stage_start)
+
+    stage_start = perf_counter()
+    result = set_aside(outcome, first_name, part_number, parsed_quantity)
+    stages["set_aside_seconds"] = _elapsed_since(stage_start)
+    status = result.get("status")
+    _log_tool_timing(
+        tool_name="set_aside",
+        total_start=total_start,
+        stages=stages,
+        result_status=status if isinstance(status, str) else None,
+    )
+    return result
 
 
 async def transfer_to_human_for_session(
     ctx: RunContext[PartsLineSessionState], reason: str
 ) -> TransferResult:
-    return transfer_to_human(ctx.userdata.call_outcome, reason)
+    total_start = perf_counter()
+    stages: dict[str, float] = {}
+
+    stage_start = perf_counter()
+    outcome = ctx.userdata.call_outcome
+    stages["outcome_access_seconds"] = _elapsed_since(stage_start)
+
+    stage_start = perf_counter()
+    result = transfer_to_human(outcome, reason)
+    stages["transfer_seconds"] = _elapsed_since(stage_start)
+    status = result.get("status")
+    _log_tool_timing(
+        tool_name="transfer_to_human",
+        total_start=total_start,
+        stages=stages,
+        result_status=status if isinstance(status, str) else None,
+    )
+    return result
 
 
 LOOKUP_PART_TOOL = function_tool(
@@ -213,6 +266,33 @@ TRANSFER_TO_HUMAN_TOOL = function_tool(
 
 
 TURN_METRICS_LOG_EVENT = "partsline_turn_metrics"
+
+
+def _elapsed_since(start: float) -> float:
+    return perf_counter() - start
+
+
+def _log_tool_timing(
+    *,
+    tool_name: str,
+    total_start: float,
+    stages: dict[str, float],
+    result_status: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "event": TOOL_TIMING_LOG_EVENT,
+        "tool_name": tool_name,
+        "total_seconds": _elapsed_since(total_start),
+        "stages": stages,
+    }
+    if result_status is not None:
+        payload["result_status"] = result_status
+
+    LOGGER.info(
+        "%s %s",
+        TOOL_TIMING_LOG_EVENT,
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+    )
 
 
 def _numeric_metric(metrics: object, key: str) -> float | None:
